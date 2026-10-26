@@ -191,7 +191,7 @@ const store = {
 const SP_COLORS = ['--s1','--s2','--s3','--s4','--s5','--s6'];
 
 // ---------- state ----------
-let file = null, audioURL = null;
+let file = null, audioURL = null, durSec = 0;
 let cur = {
   id: 'sample', title: '현장 점검 회의 (예시)', sample: true, date: '',
   speakers: ['화자 1','화자 2','화자 3'],
@@ -253,7 +253,8 @@ function pick(f){
   file=f; if(audioURL) URL.revokeObjectURL(audioURL); audioURL=URL.createObjectURL(f);
   $('fileinfo').hidden=false; $('fileinfo').textContent=`${f.name} · ${fmtSize(f.size)}`;
   const probe=new Audio(); probe.preload='metadata'; probe.src=audioURL;
-  probe.onloadedmetadata=()=>{ if(isFinite(probe.duration)){ const min=Math.ceil(probe.duration/60); $('fileinfo').textContent=`${f.name} · ${fmtSize(f.size)} · ${fmt(probe.duration)}`; $('est').textContent = `예상 처리 시간 약 ${Math.max(1,Math.ceil(min/6))}~${Math.max(2,Math.ceil(min/3))}분`; } };
+  durSec=0;
+  probe.onloadedmetadata=()=>{ if(isFinite(probe.duration)){ durSec=probe.duration; const min=Math.ceil(probe.duration/60); $('fileinfo').textContent=`${f.name} · ${fmtSize(f.size)} · ${fmt(probe.duration)}`; $('est').textContent = min<=5 ? '예상 처리 시간 30초 안팎' : `예상 처리 시간 약 ${Math.ceil(min/10)}~${Math.ceil(min/4)}분`; } };
   updateRun();
 }
 function updateRun(){ $('run').disabled = !file; $('run').textContent = key() ? '대화록 만들기' : '대화록 만들기 (API 키 필요)'; }
@@ -289,12 +290,26 @@ async function uploadFile(f, mime, onTick){
   return {fileData:{mimeType:info.mimeType||mime, fileUri:info.uri}};
 }
 function toB64(f){ return new Promise((ok,no)=>{ const r=new FileReader(); r.onload=()=>ok(String(r.result).split(',')[1]); r.onerror=()=>no(new Error('파일을 읽지 못했어요.')); r.readAsDataURL(f); }); }
-async function generate(parts, json){
+let noThinkCfg=false;
+async function generate(parts, json, limitSec){
   const model=$('model').value;
-  const res=await fetch(`${API}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key())}`,{
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({contents:[{role:'user',parts}], generationConfig:{temperature:0.2, maxOutputTokens:65536, ...(json?{responseMimeType:'application/json'}:{})}})
-  });
+  const call=async(withThink)=>{
+    const ctrl=new AbortController(); const timer=setTimeout(()=>ctrl.abort(), (limitSec||180)*1000);
+    try{
+      return await fetch(`${API}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key())}`,{
+        method:'POST', headers:{'Content-Type':'application/json'}, signal:ctrl.signal,
+        body:JSON.stringify({contents:[{role:'user',parts}], generationConfig:{temperature:0.2, maxOutputTokens:65536, ...(json?{responseMimeType:'application/json'}:{}), ...(withThink?{thinkingConfig:{thinkingLevel:'low'}}:{})}})
+      });
+    }catch(e){
+      if(e.name==='AbortError') throw new Error(`${Math.round((limitSec||180)/60)}분이 지나도 응답이 없어 멈췄어요. 다시 시도하거나 설정에서 Flash-Lite 모델로 바꿔 보세요.`);
+      throw e;
+    }finally{ clearTimeout(timer); }
+  };
+  let res=await call(!noThinkCfg);
+  if(res.status===400 && !noThinkCfg){ // 생각 설정을 지원하지 않는 모델이면 빼고 다시
+    let msg=''; try{ msg=(await res.clone().json()).error?.message||''; }catch(e){}
+    if(/think/i.test(msg)){ noThinkCfg=true; res=await call(false); }
+  }
   if(!res.ok) throw new Error(await apiErr(res));
   const j=await res.json(); const c=j.candidates?.[0];
   if(!c) throw new Error('응답이 비어 있어요. ' + (j.promptFeedback?.blockReason ? '(차단됨: '+j.promptFeedback.blockReason+')' : '다시 시도해 주세요.'));
@@ -316,8 +331,9 @@ function parseTranscript(text){
 $('run').onclick = async ()=>{
   if(!key()){ $('settings').open=true; $('apiKey').focus(); toast('먼저 Gemini API 키를 넣어 주세요'); return; }
   if(!file) return;
-  const st=$('status'); $('run').disabled=true;
+  const st=$('status'); $('run').disabled=true; let tick=null;
   try{
+    if(/\.(amr|3gp|3ga)$/i.test(file.name)) throw new Error('이 녹음 형식(amr·3gp)은 Gemini가 읽지 못해요. 폰 녹음 설정에서 m4a로 바꾸거나 mp3로 변환해서 올려 주세요.');
     const mime=guessMime(file); let part;
     if(file.size < 14*1048576){
       status(st,[{t:'파일 준비 중…'}],true);
@@ -326,7 +342,10 @@ $('run').onclick = async ()=>{
       status(st,[{t:`큰 파일이라 Google에 먼저 올리는 중… (${fmtSize(file.size)})`}],true);
       part=await uploadFile(file, mime, i=>status(st,[{t:'업로드 완료'},{t:'Google에서 파일 처리 중…'+'.'.repeat(i%4)}],true));
     }
-    status(st,[{t:'목소리를 구분하며 받아쓰는 중… 녹음 길이에 따라 몇 분 걸려요. 이 창을 닫지 마세요.'}],true);
+    const t0=Date.now();
+    const msg='목소리를 구분하며 받아쓰는 중… 화면을 끄거나 다른 앱으로 가지 마세요.';
+    status(st,[{t:msg},{t:'0초 경과'}],true);
+    tick=setInterval(()=>status(st,[{t:msg},{t:`${Math.round((Date.now()-t0)/1000)}초 경과`}],true),1000);
     const n=$('spk').value, lang=$('lang').value, ctx=$('ctx').value.trim();
     const prompt = `이 녹음을 처음부터 끝까지 빠짐없이 받아쓰기 해 주세요.
 
@@ -340,7 +359,8 @@ $('run').onclick = async ()=>{
 
 다음 JSON 형식으로만 답하세요:
 {"speakers":["화자 1","화자 2"],"segments":[{"start":"00:03","speaker":"화자 1","text":"..."}]}`;
-    const out=await generate([part,{text:prompt}], true);
+    const out=await generate([part,{text:prompt}], true, Math.min(1200, 120 + Math.round((durSec||600)*0.6)));
+    clearInterval(tick);
     const {data, cut}=parseTranscript(out.text);
     const segs=(data.segments||[]).filter(s=>s && s.text).map(s=>({start:String(s.start||'00:00'), speaker:String(s.speaker||'화자 1'), text:String(s.text).trim()}));
     if(!segs.length) throw new Error('받아쓴 내용이 없어요. 말소리가 들어 있는 파일인지 확인해 주세요.');
@@ -352,7 +372,7 @@ $('run').onclick = async ()=>{
     $('result').scrollIntoView({behavior:'smooth',block:'start'});
   }catch(e){
     status(st,[{t:e.message.includes('Failed to fetch')?'인터넷 연결을 확인해 주세요. (또는 파일을 컴퓨터에서 직접 열지 말고 웹 주소로 열어 주세요)':e.message,cls:'err'}],false);
-  }finally{ $('run').disabled=!file; }
+  }finally{ clearInterval(tick); $('run').disabled=!file; }
 };
 
 // ---------- summary ----------
